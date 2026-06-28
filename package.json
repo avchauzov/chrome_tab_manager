@@ -1,0 +1,11 @@
+{
+  "name": "tab-manager",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/check.mjs",
+    "smoke": "node scripts/smoke-static.mjs"
+  }
+}
