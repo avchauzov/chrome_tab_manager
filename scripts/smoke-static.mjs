@@ -18,9 +18,9 @@ const manifest = JSON.parse(read('manifest.json'));
 assert(manifest.manifest_version === 3, 'manifest must be MV3');
 assert(manifest.background?.type === 'module', 'background must use ES modules');
 assert(existsSync(join(root, manifest.background.service_worker)), 'background.js missing');
+assert(!manifest.action.default_popup, 'manifest must not set action.default_popup');
 
 for (const path of [
-  manifest.action.default_popup,
   manifest.options_ui.page,
   manifest.action.default_icon,
   manifest.icons['128'],
@@ -28,25 +28,19 @@ for (const path of [
   assert(existsSync(join(root, path)), `missing manifest asset: ${path}`);
 }
 
-for (const html of [manifest.action.default_popup, manifest.options_ui.page]) {
-  const content = read(html);
-  assert(content.includes('type="module"'), `${html} must load scripts as modules`);
-}
+const optionsPage = read(manifest.options_ui.page);
+assert(optionsPage.includes('type="module"'), `${manifest.options_ui.page} must load scripts as modules`);
 
-const popupActions = ['sortAndDedupe', 'groupByDomain', 'checkStale', 'getStatus'];
 const background = read('background.js');
-for (const action of popupActions) {
-  assert(background.includes(`case '${action}'`), `background missing handler: ${action}`);
-}
+assert(background.includes('chrome.action.onClicked'), 'background must handle chrome.action.onClicked');
 assert(background.includes("case 'settingsUpdated'"), 'background missing settingsUpdated handler');
+assert(background.includes('getLastFocusedWindowId'), 'background must track last focused window');
+assert(background.includes('runWindowPipeline'), 'background must define runWindowPipeline');
 
 const options = read('options.js');
 assert(!options.includes('entry.message;'), 'options log must not concatenate entry.message into innerHTML');
 assert(options.includes('appendText'), 'options log must render via DOM text API');
 assert(options.includes("import { DEFAULT_SETTINGS }"), 'options must import DEFAULT_SETTINGS');
-
-const popup = read('popup.js');
-assert(popup.includes("import { DEFAULT_SETTINGS }"), 'popup must import DEFAULT_SETTINGS');
 
 const settings = read('lib/settings.js');
 const settingsKeys = [...settings.matchAll(/^\s{2}(\w+):/gm)].map((m) => m[1]);

@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { accessKey, getLastAccess } from '../lib/access.js';
-import { pickWinner } from '../lib/dedup.js';
-import { isStaleGroup } from '../lib/grouping.js';
-import { isStaleCandidate } from '../lib/stale.js';
+import { pickWinner, pickRealtimeWinner } from '../lib/dedup.js';
+import { colorForHostname, isStaleGroup } from '../lib/grouping.js';
+import { isStaleCandidate, shouldDiscardTab } from '../lib/stale.js';
 import { formatSummary } from '../lib/log.js';
-import { getHostname, isSupportedUrl, normalizeUrl } from '../lib/normalize.js';
+import { getHostname, isSupportedUrl, normalizeUrl, formatLogUrl } from '../lib/normalize.js';
 
 const baseUrl = 'https://shop.com/item/42';
 
@@ -41,15 +41,31 @@ test('getHostname lowercases supported hostnames', () => {
   assert.equal(getHostname('https://EXAMPLE.com/Page'), 'example.com');
 });
 
+test('formatLogUrl omits query and hash from action log messages', () => {
+  assert.equal(formatLogUrl('https://x.com/p?utm_token=secret#hash'), 'x.com/p');
+  assert.equal(formatLogUrl('chrome://extensions'), '(unsupported)');
+});
+
 test('formatSummary reports empty and pluralized changes', () => {
-  assert.equal(formatSummary({ closed: 0, grouped: 0, stale: 0, ungrouped: 0 }), 'No changes');
   assert.equal(
-    formatSummary({ closed: 1, grouped: 2, stale: 1, ungrouped: 2 }),
+    formatSummary({ closed: 0, grouped: 0, stale: 0, discarded: 0, ungrouped: 0 }),
+    'No changes'
+  );
+  assert.equal(
+    formatSummary({ closed: 1, grouped: 2, stale: 1, discarded: 0, ungrouped: 2 }),
     'Closed 1 duplicate, grouped 2 tabs, moved 1 tab to Stale, ungrouped 2 single-tab groups'
+  );
+  assert.equal(
+    formatSummary({ closed: 0, grouped: 0, stale: 2, discarded: 2, ungrouped: 0 }),
+    'moved 2 tabs to Stale, discarded 2'
+  );
+  assert.equal(
+    formatSummary({ closed: 0, grouped: 0, stale: 0, discarded: 3, ungrouped: 0 }),
+    'discarded 3'
   );
 });
 
-test('pickWinner priority: preferred > active > lastAccess > focused > maxId', () => {
+test('pickWinner priority: active > lastAccess > focused > maxId', () => {
   const urlLastAccess = {
     [accessKey('https://a.com/1')]: 100,
     [accessKey('https://a.com/2')]: 200,
@@ -61,10 +77,6 @@ test('pickWinner priority: preferred > active > lastAccess > focused > maxId', (
   ];
   const ctx = { mode: 'manual', focusedWindowId: 10, urlLastAccess };
 
-  assert.equal(
-    pickWinner(tabs, { ...ctx, mode: 'realtime', preferredTabId: 1 }).id,
-    1
-  );
   assert.equal(pickWinner(tabs, { ...ctx, activeTabId: 3 }).id, 3);
   assert.equal(pickWinner(tabs, ctx).id, 2);
   assert.equal(
@@ -87,6 +99,61 @@ test('pickWinner priority: preferred > active > lastAccess > focused > maxId', (
     ).id,
     7
   );
+});
+
+test('pickRealtimeWinner prefers duplicate in last focused window', () => {
+  const url = 'https://example.com/page';
+  const urlLastAccess = { [accessKey(url)]: 100 };
+  const tabs = [
+    { id: 1, url, windowId: 10, active: false },
+    { id: 2, url, windowId: 20, active: false },
+  ];
+
+  assert.equal(
+    pickRealtimeWinner(tabs, {
+      lastFocusedWindowId: 10,
+      activeTabId: 2,
+      urlLastAccess,
+      focusedWindowId: 20,
+    }).id,
+    1
+  );
+});
+
+test('pickRealtimeWinner falls back when no duplicate is in last focused window', () => {
+  const url = 'https://example.com/page';
+  const urlLastAccess = { [accessKey(url)]: 100 };
+  const tabs = [
+    { id: 1, url, windowId: 30, active: false },
+    { id: 2, url, windowId: 40, active: true },
+  ];
+
+  assert.equal(
+    pickRealtimeWinner(tabs, {
+      lastFocusedWindowId: 10,
+      activeTabId: 2,
+      urlLastAccess,
+      focusedWindowId: 40,
+    }).id,
+    2
+  );
+});
+
+test('shouldDiscardTab skips active, audible, discarded, and pinned tabs', () => {
+  assert.equal(shouldDiscardTab({ active: true, audible: false, discarded: false, pinned: false }), false);
+  assert.equal(shouldDiscardTab({ active: false, audible: true, discarded: false, pinned: false }), false);
+  assert.equal(shouldDiscardTab({ active: false, audible: false, discarded: true, pinned: false }), false);
+  assert.equal(shouldDiscardTab({ active: false, audible: false, discarded: false, pinned: true }), false);
+  assert.equal(shouldDiscardTab({ active: false, audible: false, discarded: false, pinned: false }), true);
+});
+
+test('colorForHostname is deterministic and uses domain palette', () => {
+  const palette = ['blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange'];
+  const first = colorForHostname('example.com');
+  const second = colorForHostname('example.com');
+  assert.equal(first, second);
+  assert.equal(palette.includes(first), true);
+  assert.equal(palette.includes(colorForHostname('other.example.com')), true);
 });
 
 test('isStaleGroup matches only the Stale title', () => {

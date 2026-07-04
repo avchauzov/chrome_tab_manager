@@ -12,9 +12,27 @@ const fields = {
   runOnStartup: document.getElementById('runOnStartup'),
 };
 
+const INT_FIELDS = {
+  debounceMs: { min: 100 },
+  minTabsPerGroup: { min: 2 },
+  staleThresholdDays: { min: 0 },
+  intervalMinutes: { min: 1 },
+};
+
 const saveBtn = document.getElementById('save');
 const savedEl = document.getElementById('saved');
 const logsEl = document.getElementById('logs');
+
+function readInt(key) {
+  const field = fields[key];
+  const fallback = DEFAULT_SETTINGS[key];
+  const parsed = Number.parseInt(field.value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+
+  const min = INT_FIELDS[key]?.min;
+  if (min !== undefined && parsed < min) return min;
+  return parsed;
+}
 
 function loadSettings() {
   chrome.storage.sync.get(DEFAULT_SETTINGS, (data) => {
@@ -59,13 +77,13 @@ function loadLogs() {
 saveBtn.addEventListener('click', () => {
   const settings = {
     realTimeDedupEnabled: fields.realTimeDedupEnabled.checked,
-    debounceMs: parseInt(fields.debounceMs.value, 10),
+    debounceMs: readInt('debounceMs'),
     autoGroupByDomain: fields.autoGroupByDomain.checked,
-    minTabsPerGroup: parseInt(fields.minTabsPerGroup.value, 10),
+    minTabsPerGroup: readInt('minTabsPerGroup'),
     sortInsideGroups: fields.sortInsideGroups.checked,
-    staleThresholdDays: parseInt(fields.staleThresholdDays.value, 10),
+    staleThresholdDays: readInt('staleThresholdDays'),
     autoCheckStale: fields.autoCheckStale.checked,
-    intervalMinutes: parseInt(fields.intervalMinutes.value, 10),
+    intervalMinutes: readInt('intervalMinutes'),
     runOnStartup: fields.runOnStartup.checked,
   };
 

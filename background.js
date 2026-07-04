@@ -1,35 +1,54 @@
 import { getSettings } from './lib/settings.js';
 import { accessKey, getUrlLastAccess } from './lib/access.js';
 import { isSupportedUrl } from './lib/normalize.js';
-import { closeDuplicatesAcrossAllWindows } from './lib/dedup.js';
+import {
+  closeDuplicatesAcrossAllWindows,
+  closeDuplicatesInWindow,
+  pickRealtimeWinner,
+} from './lib/dedup.js';
 import {
   groupTabsByHostname,
   groupTabsByHostnameForAllWindows,
   cleanupSingleTabHostnameGroups,
+  isInStaleGroup,
 } from './lib/grouping.js';
 import { checkStaleTabs, checkStaleTabsForAllWindows } from './lib/stale.js';
 import {
   sortTabs,
-  sortTabsForAllWindows,
   sortTabsInsideHostnameGroups,
-  sortTabsInsideHostnameGroupsForAllWindows,
 } from './lib/sort.js';
-import { setLastStatus, formatSummary } from './lib/log.js';
 import {
   safeTabsGet,
+  safeTabsUngroup,
   safeAlarmsClear,
   safeAlarmsCreate,
-  safeStorageLocalGet,
+  safeAlarmsGet,
   safeStorageLocalSet,
-  safeWindowsGetCurrent,
+  safeWindowsGetAll,
 } from './lib/safe.js';
 
 const ALARM_NAME = 'tabManagerTick';
 const debounceTimers = new Map();
+let lastFocusedWindowId = null;
 
-const createSummary = () => ({ closed: 0, grouped: 0, stale: 0, ungrouped: 0 });
+async function getLastFocusedWindowId() {
+  if (lastFocusedWindowId == null) {
+    try {
+      const win = await chrome.windows.getLastFocused();
+      lastFocusedWindowId = win?.id ?? null;
+    } catch {
+      lastFocusedWindowId = null;
+    }
+  }
+  return lastFocusedWindowId;
+}
 
-async function setupAlarm() {
+async function setupAlarm(forceRecreate = false) {
+  if (!forceRecreate) {
+    const existing = await safeAlarmsGet(ALARM_NAME);
+    if (existing) return;
+  }
+
   const { intervalMinutes } = await getSettings();
   await safeAlarmsClear(ALARM_NAME);
   await safeAlarmsCreate(ALARM_NAME, { periodInMinutes: intervalMinutes });
@@ -42,94 +61,40 @@ async function updateLastAccess(url) {
   await safeStorageLocalSet({ urlLastAccess });
 }
 
-async function runAlarmPipeline() {
+async function runWindowPipeline(windowId, { includeGrouping = false } = {}) {
   const settings = await getSettings();
-  const summary = createSummary();
 
-  summary.closed += (await closeDuplicatesAcrossAllWindows({ mode: 'alarm' })).closedCount;
-  summary.ungrouped += await cleanupSingleTabHostnameGroups(undefined, settings);
-
-  if (settings.autoGroupByDomain) {
-    summary.grouped += await groupTabsByHostnameForAllWindows(settings);
-    if (settings.sortInsideGroups) {
-      await sortTabsInsideHostnameGroupsForAllWindows(settings);
-    }
-  }
+  await closeDuplicatesInWindow(windowId);
 
   if (settings.autoCheckStale) {
-    summary.stale += await checkStaleTabsForAllWindows();
+    await checkStaleTabs(windowId);
   }
 
-  summary.ungrouped += await cleanupSingleTabHostnameGroups(undefined, settings);
-  await sortTabsForAllWindows(settings);
+  await cleanupSingleTabHostnameGroups(windowId, settings);
 
-  await setLastStatus(formatSummary(summary));
-  return summary;
-}
-
-async function currentWindowId(requestedWindowId) {
-  if (requestedWindowId !== undefined) return requestedWindowId;
-  return (await safeWindowsGetCurrent())?.id;
-}
-
-async function respondWithSummary(summary) {
-  const text = formatSummary(summary);
-  await setLastStatus(text);
-  return { ok: true, summary: text };
-}
-
-async function sortAndDedupe(windowId) {
-  const settings = await getSettings();
-  const summary = createSummary();
-
-  summary.closed += (
-    await closeDuplicatesAcrossAllWindows({ mode: 'manual' })
-  ).closedCount;
-
-  if (windowId !== undefined) {
-    await sortTabs(windowId, settings);
+  if (includeGrouping && settings.autoGroupByDomain) {
+    await groupTabsByHostname(windowId, settings);
   }
 
-  summary.ungrouped += await cleanupSingleTabHostnameGroups(undefined, settings);
-  return respondWithSummary(summary);
+  await sortTabs(windowId, settings);
+  await sortTabsInsideHostnameGroups(windowId, settings);
 }
 
-async function groupByDomain(windowId) {
-  const settings = await getSettings();
-  const summary = createSummary();
+async function runAlarmPipeline() {
+  const focusedId = await getLastFocusedWindowId();
+  const windows = await safeWindowsGetAll();
 
-  if (windowId !== undefined) {
-    summary.grouped += await groupTabsByHostname(windowId, settings);
-    await sortTabsInsideHostnameGroups(windowId, settings);
+  for (const win of windows) {
+    if (focusedId != null && win.id === focusedId) continue;
+    await runWindowPipeline(win.id, { includeGrouping: true });
   }
-
-  summary.ungrouped += await cleanupSingleTabHostnameGroups(undefined, settings);
-  return respondWithSummary(summary);
-}
-
-async function checkStale(windowId) {
-  const summary = createSummary();
-  if (windowId !== undefined) {
-    summary.stale += await checkStaleTabs(windowId);
-  }
-  return respondWithSummary(summary);
 }
 
 async function handleMessage(msg) {
   switch (msg.action) {
     case 'settingsUpdated':
-      await setupAlarm();
+      await setupAlarm(true);
       return { ok: true };
-    case 'sortAndDedupe':
-      return sortAndDedupe(await currentWindowId(msg.windowId));
-    case 'groupByDomain':
-      return groupByDomain(await currentWindowId(msg.windowId));
-    case 'checkStale':
-      return checkStale(await currentWindowId(msg.windowId));
-    case 'getStatus': {
-      const data = await safeStorageLocalGet('lastActionSummary');
-      return { ok: true, summary: data.lastActionSummary || 'Ready' };
-    }
     default:
       return { ok: false };
   }
@@ -153,6 +118,7 @@ async function runStartupPipeline() {
 }
 
 async function initExtension() {
+  await getLastFocusedWindowId();
   await setupAlarm();
   await runStartupPipeline();
 }
@@ -164,18 +130,14 @@ async function handleRealTimeDedup(tabId) {
   const tab = await safeTabsGet(tabId);
   if (!tab || !isSupportedUrl(tab.url)) return;
 
-  const result = await closeDuplicatesAcrossAllWindows({
-    preferredTabId: tabId,
+  const lastFocusedId = await getLastFocusedWindowId();
+  await closeDuplicatesAcrossAllWindows({
     mode: 'realtime',
+    winnerPicker: pickRealtimeWinner,
+    lastFocusedWindowId: lastFocusedId,
   });
 
   await cleanupSingleTabHostnameGroups(undefined, settings);
-
-  if (result.closedCount > 0) {
-    await setLastStatus(
-      formatSummary({ closed: result.closedCount, grouped: 0, stale: 0, ungrouped: 0 })
-    );
-  }
 }
 
 function scheduleRealTimeDedup(tabId) {
@@ -195,6 +157,12 @@ function scheduleRealTimeDedup(tabId) {
     .catch(() => {});
 }
 
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) {
+    lastFocusedWindowId = windowId;
+  }
+});
+
 chrome.runtime.onInstalled.addListener(() => {
   initExtension().catch(() => {});
 });
@@ -209,10 +177,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
+chrome.action.onClicked.addListener((tab) => {
+  runWindowPipeline(tab.windowId).catch(() => {});
+});
+
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-  safeTabsGet(tabId).then((tab) => {
-    if (tab?.url) updateLastAccess(tab.url).catch(() => {});
-  });
+  (async () => {
+    const tab = await safeTabsGet(tabId);
+    if (!tab) return;
+    if (await isInStaleGroup(tab)) {
+      await safeTabsUngroup([tabId]);
+    }
+    if (tab.url) await updateLastAccess(tab.url);
+  })().catch(() => {});
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
