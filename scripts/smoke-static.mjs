@@ -36,6 +36,37 @@ assert(background.includes('chrome.action.onClicked'), 'background must handle c
 assert(background.includes("case 'settingsUpdated'"), 'background missing settingsUpdated handler');
 assert(background.includes('getLastFocusedWindowId'), 'background must track last focused window');
 assert(background.includes('runWindowPipeline'), 'background must define runWindowPipeline');
+assert(background.includes('function enqueueOp'), 'background must serialize top-level work');
+assert(background.includes('layoutWindow'), 'background must lay windows out');
+assert(background.includes('recordLastObservedAt'), 'background must record URL observation');
+assert(!background.includes("status === 'complete' && tab.url"), 'complete must not write access');
+
+const organizeBody = background.slice(
+  background.indexOf('async function organizeWindow'),
+  background.indexOf('async function runWindowPipeline')
+);
+const groupAt = organizeBody.indexOf('groupTabsByHostname');
+const staleAt = organizeBody.indexOf('checkStaleTabs');
+const cleanupAt = organizeBody.indexOf('cleanupSingleTabHostnameGroups');
+const layoutAt = organizeBody.indexOf('layoutWindow');
+assert(
+  groupAt !== -1 && groupAt < staleAt && staleAt < cleanupAt && cleanupAt < layoutAt,
+  'organizeWindow must group, then stale, then cleanup, then layout'
+);
+
+const updatedBody = background.slice(
+  background.indexOf('async function handleUpdated'),
+  background.indexOf('chrome.windows.onFocusChanged')
+);
+assert(updatedBody.includes('if (changeInfo.url && nextUrl)'), 'URL changes must record observation');
+assert(!updatedBody.includes('touchLastSeenAt'), 'complete/update must not record attention');
+
+const realtimeBody = background.slice(
+  background.indexOf('async function handleRealTimeDedup'),
+  background.indexOf('function scheduleRealTimeDedup')
+);
+assert(!realtimeBody.includes('layoutWindow'), 'realtime dedup must not lay out the window');
+assert(!realtimeBody.includes('groupTabsByHostname'), 'realtime dedup must not regroup');
 
 const options = read('options.js');
 assert(!options.includes('entry.message;'), 'options log must not concatenate entry.message into innerHTML');

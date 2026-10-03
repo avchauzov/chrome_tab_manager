@@ -1,5 +1,5 @@
 import { getSettings } from './lib/settings.js';
-import { accessKey, getUrlLastAccess } from './lib/access.js';
+import { recordLastObservedAt, touchLastSeenAt } from './lib/access.js';
 import { isSupportedUrl } from './lib/normalize.js';
 import {
   closeDuplicatesAcrossAllWindows,
@@ -8,28 +8,30 @@ import {
 } from './lib/dedup.js';
 import {
   groupTabsByHostname,
-  groupTabsByHostnameForAllWindows,
   cleanupSingleTabHostnameGroups,
   isInStaleGroup,
 } from './lib/grouping.js';
-import { checkStaleTabs, checkStaleTabsForAllWindows } from './lib/stale.js';
-import {
-  sortTabs,
-  sortTabsInsideHostnameGroups,
-} from './lib/sort.js';
+import { checkStaleTabs } from './lib/stale.js';
+import { layoutWindow } from './lib/sort.js';
 import {
   safeTabsGet,
   safeTabsUngroup,
   safeAlarmsClear,
   safeAlarmsCreate,
   safeAlarmsGet,
-  safeStorageLocalSet,
   safeWindowsGetAll,
 } from './lib/safe.js';
 
 const ALARM_NAME = 'tabManagerTick';
 const debounceTimers = new Map();
 let lastFocusedWindowId = null;
+let opChain = Promise.resolve();
+
+function enqueueOp(fn) {
+  const run = opChain.then(fn, fn);
+  opChain = run.then(() => {}, () => {});
+  return run;
+}
 
 async function getLastFocusedWindowId() {
   if (lastFocusedWindowId == null) {
@@ -54,30 +56,21 @@ async function setupAlarm(forceRecreate = false) {
   await safeAlarmsCreate(ALARM_NAME, { periodInMinutes: intervalMinutes });
 }
 
-async function updateLastAccess(url) {
-  if (!url) return;
-  const urlLastAccess = await getUrlLastAccess();
-  urlLastAccess[accessKey(url)] = Date.now();
-  await safeStorageLocalSet({ urlLastAccess });
-}
-
-async function runWindowPipeline(windowId, { includeGrouping = false } = {}) {
+async function organizeWindow(windowId) {
   const settings = await getSettings();
-
-  await closeDuplicatesInWindow(windowId);
-
+  if (settings.autoGroupByDomain) {
+    await groupTabsByHostname(windowId, settings);
+  }
   if (settings.autoCheckStale) {
     await checkStaleTabs(windowId);
   }
-
   await cleanupSingleTabHostnameGroups(windowId, settings);
+  await layoutWindow(windowId, settings);
+}
 
-  if (includeGrouping && settings.autoGroupByDomain) {
-    await groupTabsByHostname(windowId, settings);
-  }
-
-  await sortTabs(windowId, settings);
-  await sortTabsInsideHostnameGroups(windowId, settings);
+async function runWindowPipeline(windowId) {
+  await closeDuplicatesInWindow(windowId);
+  await organizeWindow(windowId);
 }
 
 async function runAlarmPipeline() {
@@ -86,7 +79,7 @@ async function runAlarmPipeline() {
 
   for (const win of windows) {
     if (focusedId != null && win.id === focusedId) continue;
-    await runWindowPipeline(win.id, { includeGrouping: true });
+    await runWindowPipeline(win.id);
   }
 }
 
@@ -106,15 +99,10 @@ async function runStartupPipeline() {
 
   await closeDuplicatesAcrossAllWindows({ mode: 'alarm' });
 
-  if (settings.autoGroupByDomain) {
-    await groupTabsByHostnameForAllWindows(settings);
+  const windows = await safeWindowsGetAll();
+  for (const win of windows) {
+    await organizeWindow(win.id);
   }
-
-  if (settings.autoCheckStale) {
-    await checkStaleTabsForAllWindows();
-  }
-
-  await cleanupSingleTabHostnameGroups(undefined, settings);
 }
 
 async function initExtension() {
@@ -150,11 +138,33 @@ function scheduleRealTimeDedup(tabId) {
         tabId,
         setTimeout(() => {
           debounceTimers.delete(tabId);
-          handleRealTimeDedup(tabId).catch(() => {});
+          enqueueOp(() => handleRealTimeDedup(tabId)).catch(() => {});
         }, settings.debounceMs)
       );
     })
     .catch(() => {});
+}
+
+async function handleActivated({ tabId }) {
+  const tab = await safeTabsGet(tabId);
+  if (!tab) return;
+
+  const wasStale = await isInStaleGroup(tab);
+  if (tab.url) await touchLastSeenAt(tab.url);
+  if (!wasStale) return;
+
+  await safeTabsUngroup([tabId]);
+  await layoutWindow(tab.windowId, await getSettings());
+}
+
+async function handleUpdated(tabId, changeInfo, tab) {
+  const nextUrl = tab?.url || changeInfo.url;
+  if (changeInfo.url && nextUrl) {
+    await recordLastObservedAt(nextUrl);
+  }
+  if (changeInfo.url || changeInfo.status === 'complete') {
+    scheduleRealTimeDedup(tabId);
+  }
 }
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
@@ -164,50 +174,33 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  initExtension().catch(() => {});
+  enqueueOp(() => initExtension()).catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  initExtension().catch(() => {});
+  enqueueOp(() => initExtension()).catch(() => {});
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) {
-    runAlarmPipeline().catch(() => {});
-  }
+  if (alarm.name !== ALARM_NAME) return;
+  enqueueOp(() => runAlarmPipeline()).catch(() => {});
 });
 
 chrome.action.onClicked.addListener((tab) => {
-  runWindowPipeline(tab.windowId).catch(() => {});
+  enqueueOp(() => runWindowPipeline(tab.windowId)).catch(() => {});
 });
 
-chrome.tabs.onActivated.addListener(({ tabId }) => {
-  (async () => {
-    const tab = await safeTabsGet(tabId);
-    if (!tab) return;
-    if (await isInStaleGroup(tab)) {
-      await safeTabsUngroup([tabId]);
-    }
-    if (tab.url) await updateLastAccess(tab.url);
-  })().catch(() => {});
+chrome.tabs.onActivated.addListener((info) => {
+  enqueueOp(() => handleActivated(info)).catch(() => {});
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.url || changeInfo.status === 'complete') {
-    scheduleRealTimeDedup(tabId);
-  }
-  if (changeInfo.status === 'complete' && tab.url) {
-    updateLastAccess(tab.url).catch(() => {});
-  }
+  enqueueOp(() => handleUpdated(tabId, changeInfo, tab)).catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  (async () => {
-    try {
-      sendResponse(await handleMessage(msg));
-    } catch {
-      sendResponse({ ok: false, summary: 'Error' });
-    }
-  })();
+  enqueueOp(() => handleMessage(msg))
+    .then((result) => sendResponse(result))
+    .catch(() => sendResponse({ ok: false, summary: 'Error' }));
   return true;
 });

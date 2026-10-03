@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { accessKey, getLastAccess } from '../lib/access.js';
+import {
+  accessKey,
+  effectiveLastAccess,
+  getLastAccess,
+  readAccessEntry,
+  withLastObservedAt,
+} from '../lib/access.js';
 import { pickWinner, pickRealtimeWinner } from '../lib/dedup.js';
 import { colorForHostname, isStaleGroup } from '../lib/grouping.js';
 import { isStaleCandidate, shouldDiscardTab } from '../lib/stale.js';
@@ -28,6 +34,26 @@ test('normalizeUrl strips tracking noise and preserves meaningful query params',
   assert.equal(
     normalizeUrl('HTTPS://Example.com/path/?utm_source=x&b=2&a=1#section'),
     'https://example.com/path?a=1&b=2'
+  );
+  assert.equal(
+    normalizeUrl('https://example.com/page?utm_source=chatgpt.com'),
+    'https://example.com/page'
+  );
+  assert.equal(
+    normalizeUrl('https://example.com/page?id=9&utm_source=chatgpt.com'),
+    'https://example.com/page?id=9'
+  );
+  assert.equal(
+    normalizeUrl('https://example.com/page?utm_medium=email&fbclid=1&gclid=2&dclid=3&msclkid=4&yclid=5&mc_cid=6&mc_eid=7&ref_src=twsrc'),
+    'https://example.com/page'
+  );
+  assert.equal(
+    normalizeUrl('https://example.com/page?ref=keep&source=keep&from=keep'),
+    'https://example.com/page?from=keep&ref=keep&source=keep'
+  );
+  assert.equal(
+    normalizeUrl('https://example.com/page?b=2&a=1'),
+    normalizeUrl('https://example.com/page?a=1&b=2')
   );
 });
 
@@ -65,37 +91,43 @@ test('formatSummary reports empty and pluralized changes', () => {
   );
 });
 
-test('pickWinner priority: active > lastAccess > focused > maxId', () => {
-  const urlLastAccess = {
-    [accessKey('https://a.com/1')]: 100,
-    [accessKey('https://a.com/2')]: 200,
-  };
+test('pickWinner priority: active > lastAccessed > focused > max id', () => {
+  const url = 'https://example.com/page';
   const tabs = [
-    { id: 1, url: 'https://a.com/1', windowId: 10, active: false },
-    { id: 2, url: 'https://a.com/2', windowId: 10, active: false },
-    { id: 3, url: 'https://a.com/3', windowId: 20, active: false },
+    { id: 1, url, windowId: 10, lastAccessed: 100 },
+    { id: 2, url, windowId: 10, lastAccessed: 300 },
+    { id: 3, url, windowId: 20, lastAccessed: 900 },
   ];
-  const ctx = { mode: 'manual', focusedWindowId: 10, urlLastAccess };
 
-  assert.equal(pickWinner(tabs, { ...ctx, activeTabId: 3 }).id, 3);
-  assert.equal(pickWinner(tabs, ctx).id, 2);
+  assert.equal(pickWinner(tabs, { activeTabId: 1, focusedWindowId: 10 }).id, 1);
+  assert.equal(pickWinner(tabs, { focusedWindowId: 10 }).id, 3);
   assert.equal(
     pickWinner(
       [
-        { id: 4, url: 'https://a.com/4', windowId: 10, active: false },
-        { id: 5, url: 'https://a.com/5', windowId: 10, active: false },
+        { id: 11, url, windowId: 10, lastAccessed: 500 },
+        { id: 12, url, windowId: 20, lastAccessed: 500 },
       ],
-      { ...ctx, urlLastAccess: {} }
+      { focusedWindowId: 10 }
     ).id,
-    5
+    11
   );
   assert.equal(
     pickWinner(
       [
-        { id: 6, url: 'https://a.com/6', windowId: 99, active: false },
-        { id: 7, url: 'https://a.com/7', windowId: 99, active: false },
+        { id: 4, url, windowId: 10, lastAccessed: 0 },
+        { id: 5, url, windowId: 20, lastAccessed: Number.NaN },
       ],
-      { ...ctx, urlLastAccess: {}, focusedWindowId: 99 }
+      { focusedWindowId: 10 }
+    ).id,
+    4
+  );
+  assert.equal(
+    pickWinner(
+      [
+        { id: 6, url, windowId: 99 },
+        { id: 7, url, windowId: 99 },
+      ],
+      { focusedWindowId: 1 }
     ).id,
     7
   );
@@ -162,18 +194,48 @@ test('isStaleGroup matches only the Stale title', () => {
   assert.equal(isStaleGroup(null), false);
 });
 
-test('isStaleCandidate skips tabs without an access record', () => {
-  const now = 10_000;
-  const thresholdMs = 1000;
-  const tab = { url: `${baseUrl}?utm_source=email` };
+test('effectiveLastAccess is the newest valid timestamp', () => {
+  const now = 1_700_000_000_000;
+  const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
+  const entry = { lastSeenAt: now - 50, lastObservedAt: now - 10 };
+  assert.equal(effectiveLastAccess(entry, { lastAccessed: now - 20 }), now - 10);
+  assert.equal(effectiveLastAccess({ lastObservedAt: monthAgo }, { lastAccessed: monthAgo - 5 }), monthAgo);
+  assert.equal(effectiveLastAccess({}, { lastAccessed: 0 }), undefined);
+  assert.equal(effectiveLastAccess({}, { lastAccessed: Number.NaN }), undefined);
+});
 
-  assert.equal(isStaleCandidate(tab, {}, now, thresholdMs), false);
+test('lastObservedAt is overwritten when the same URL is seen again', () => {
+  const now = 1_700_000_000_000;
+  const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
+  const key = accessKey(baseUrl);
+  const again = withLastObservedAt({ [key]: { lastObservedAt: monthAgo, lastSeenAt: monthAgo } }, baseUrl, now);
+  assert.equal(again[key].lastObservedAt, now);
+  assert.equal(again[key].lastSeenAt, monthAgo);
   assert.equal(
-    isStaleCandidate(tab, { [accessKey(baseUrl)]: now - thresholdMs - 1 }, now, thresholdMs),
-    true
-  );
-  assert.equal(
-    isStaleCandidate(tab, { [accessKey(baseUrl)]: now - thresholdMs + 1 }, now, thresholdMs),
+    isStaleCandidate({ url: baseUrl, lastAccessed: 0 }, again, now, 3 * 24 * 60 * 60 * 1000),
     false
   );
+});
+
+test('isStaleCandidate uses lastObservedAt as a URL-age bound', () => {
+  const now = 1_700_000_000_000;
+  const day = 24 * 60 * 60 * 1000;
+  const thresholdMs = 3 * day;
+  const tab = { url: `${baseUrl}?utm_source=email`, lastAccessed: now - 5 * day };
+  const key = accessKey(baseUrl);
+
+  assert.equal(isStaleCandidate(tab, {}, now, thresholdMs), false);
+  assert.equal(isStaleCandidate(tab, { [key]: now - 10 * day }, now, thresholdMs), false);
+  assert.equal(readAccessEntry({ [key]: now - 10 * day }, baseUrl).lastSeenAt, now - 10 * day);
+
+  const fresh = { [key]: { lastObservedAt: now } };
+  assert.equal(isStaleCandidate(tab, fresh, now, thresholdMs), false);
+  assert.equal(effectiveLastAccess(readAccessEntry(fresh, baseUrl), tab), now);
+
+  const aged = { [key]: { lastObservedAt: now - 5 * day } };
+  assert.equal(effectiveLastAccess(readAccessEntry(aged, baseUrl), { lastAccessed: now - 10 * day }), now - 5 * day);
+  assert.equal(isStaleCandidate({ url: baseUrl, lastAccessed: now - 10 * day }, aged, now, thresholdMs), true);
+
+  const seenRecently = { [key]: { lastObservedAt: now - day, lastSeenAt: now - day } };
+  assert.equal(isStaleCandidate({ url: baseUrl, lastAccessed: 0 }, seenRecently, now, thresholdMs), false);
 });
